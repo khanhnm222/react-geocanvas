@@ -1,26 +1,27 @@
-// GeoJSON Canvas React Library (single-file reference + docs)
-// File: src/GeoJSONCanvas.tsx
-// TypeScript React component implemented for a small library that previews GeoJSON on an HTMLCanvasElement.
+import React, { useRef, useEffect, useImperativeHandle, forwardRef, useCallback, useMemo } from 'react';
+import { FeatureId, GeoVisualizerHandle, GridConfig, LegendConfig, Styles, drawLegend } from '../types';
 
-import React, { useRef, useEffect, useImperativeHandle, forwardRef, useCallback } from 'react';
-import { FeatureId, GeoJSONCanvasHandle, Styles } from '../types';
-
-export type GeoJSONCanvasProps = {
-  width?: number; // css pixels
-  height?: number; // css pixels
+export type GeoVisualizerFullProps = {
+  width?: number;
+  height?: number;
   geojson: any; // FeatureCollection | Feature | Geometry
-  padding?: number; // padding in px when fitting bounds
+  padding?: number;
   styles?: Styles;
+  /** Background color. Use 'transparent' for no background. Defaults to '#ffffff'. */
   background?: string | null;
+  legend?: LegendConfig;
   interactive?: boolean;
   onFeatureClick?: (feature: any, id?: FeatureId, ev?: MouseEvent) => void;
   onFeatureHover?: (feature: any | null, id?: FeatureId | null, ev?: MouseEvent | null) => void;
   getFeatureId?: (feature: any, index: number) => FeatureId;
   devicePixelRatio?: number;
   fitBoundsOnLoad?: boolean;
+  showGrid?: boolean;
+  gridConfig?: GridConfig;
+  /** Minimum size (px) of the data bounding box's largest dimension before zoom-out is blocked. Default: 20 */
+  minDataPixels?: number;
 };
 
-// Simple Mercator projection helpers (not full d3-geo). Works fine for world maps and web-mercator use.
 function lonLatToMercator(lon: number, lat: number) {
   const x = (lon + 180) / 360;
   const y = (1 - Math.log(Math.tan((lat * Math.PI) / 180) + 1 / Math.cos((lat * Math.PI) / 180)) / Math.PI) / 2;
@@ -72,13 +73,150 @@ function getBoundsOfGeojson(geojson: any) {
   return { minX, minY, maxX, maxY };
 }
 
+function niceGridStep(range: number): number {
+  const candidates = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 45, 90];
+  for (const s of candidates) {
+    if (range / s <= 10) return s;
+  }
+  return 90;
+}
+
+function yNormToLat(yNorm: number): number {
+  return Math.atan(Math.sinh(Math.PI * (1 - 2 * yNorm))) * (180 / Math.PI);
+}
+
+function formatDeg(val: number, step: number): string {
+  if (step >= 1) return `${Math.round(val)}°`;
+  return `${val.toFixed(step >= 0.1 ? 1 : 2)}°`;
+}
+
+function drawGrid(
+  ctx: CanvasRenderingContext2D,
+  cssW: number,
+  cssH: number,
+  vp: { scale: number; translateX: number; translateY: number },
+  config: GridConfig,
+) {
+  const {
+    color = 'rgba(0,0,0,0.12)',
+    lineWidth = 1,
+    labelColor = '#888',
+    labelSize = 10,
+    showLabels = true,
+  } = config;
+
+  const xNormLeft  = (0    - vp.translateX) / (cssW * vp.scale);
+  const xNormRight = (cssW - vp.translateX) / (cssW * vp.scale);
+  const yNormTop   = (0    - vp.translateY) / (cssH * vp.scale);
+  const yNormBot   = (cssH - vp.translateY) / (cssH * vp.scale);
+
+  const lonLeft  = xNormLeft  * 360 - 180;
+  const lonRight = xNormRight * 360 - 180;
+  const latTop   = yNormToLat(Math.max(-0.5, yNormTop));
+  const latBot   = yNormToLat(Math.min(1.5,  yNormBot));
+
+  const lonMin = Math.max(-180, lonLeft);
+  const lonMax = Math.min(180, lonRight);
+  const latMin = Math.max(-85, latBot);
+  const latMax = Math.min(85, latTop);
+
+  if (lonMax <= lonMin || latMax <= latMin) return;
+
+  const lonStep = niceGridStep(lonMax - lonMin);
+  const latStep = niceGridStep(latMax - latMin);
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+
+  // Longitude lines (vertical)
+  const lonStart = Math.ceil(lonMin / lonStep) * lonStep;
+  for (let lon = lonStart; lon <= lonMax + 1e-9; lon = Math.round((lon + lonStep) * 1e9) / 1e9) {
+    const xNorm = (lon + 180) / 360;
+    const px = xNorm * cssW * vp.scale + vp.translateX;
+    ctx.beginPath();
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, cssH);
+    ctx.stroke();
+    if (showLabels) {
+      ctx.fillStyle = labelColor;
+      ctx.font = `${labelSize}px sans-serif`;
+      ctx.fillText(formatDeg(lon, lonStep), px + 3, labelSize + 4);
+    }
+  }
+
+  // Latitude lines (horizontal)
+  const latStart = Math.ceil(latMin / latStep) * latStep;
+  for (let lat = latStart; lat <= latMax + 1e-9; lat = Math.round((lat + latStep) * 1e9) / 1e9) {
+    const yNorm = lonLatToMercator(0, lat).y;
+    const py = yNorm * cssH * vp.scale + vp.translateY;
+    ctx.beginPath();
+    ctx.moveTo(0, py);
+    ctx.lineTo(cssW, py);
+    ctx.stroke();
+    if (showLabels) {
+      ctx.fillStyle = labelColor;
+      ctx.font = `${labelSize}px sans-serif`;
+      ctx.fillText(formatDeg(lat, latStep), 4, py - 3);
+    }
+  }
+
+  ctx.restore();
+}
+
+function clampViewport(
+  vp: { scale: number; translateX: number; translateY: number },
+  cssW: number,
+  cssH: number,
+  bounds: { minX: number; minY: number; maxX: number; maxY: number } | null,
+  padding: number,
+  minScale: number,
+) {
+  let { scale, translateX: tx, translateY: ty } = vp;
+
+  if (minScale > 0) scale = Math.max(minScale, scale);
+  if (!bounds || !cssW || !cssH) return { scale, translateX: tx, translateY: ty };
+
+  const { minX, minY, maxX, maxY } = bounds;
+
+  // X axis —————————————————————————————————————————————————
+  // "Full" range: data entirely inside canvas (both edges within [padding, W-padding])
+  const txFullMin = padding - minX * cssW * scale;        // data left edge  >= padding
+  const txFullMax = cssW - padding - maxX * cssW * scale; // data right edge <= cssW-padding
+  // "Partial" range: data overflows canvas (zoomed in) — keep at least padding px visible
+  const txPartMin = padding - maxX * cssW * scale;
+  const txPartMax = cssW - padding - minX * cssW * scale;
+
+  if (txFullMin <= txFullMax) {
+    // Data fits inside canvas: keep it fully within frame
+    tx = Math.max(txFullMin, Math.min(txFullMax, tx));
+  } else if (txPartMin <= txPartMax) {
+    // Data overflows: allow panning through data but don't let it escape entirely
+    tx = Math.max(txPartMin, Math.min(txPartMax, tx));
+  }
+
+  // Y axis —————————————————————————————————————————————————
+  const tyFullMin = padding - minY * cssH * scale;
+  const tyFullMax = cssH - padding - maxY * cssH * scale;
+  const tyPartMin = padding - maxY * cssH * scale;
+  const tyPartMax = cssH - padding - minY * cssH * scale;
+
+  if (tyFullMin <= tyFullMax) {
+    ty = Math.max(tyFullMin, Math.min(tyFullMax, ty));
+  } else if (tyPartMin <= tyPartMax) {
+    ty = Math.max(tyPartMin, Math.min(tyPartMax, ty));
+  }
+
+  return { scale, translateX: tx, translateY: ty };
+}
+
 const defaultStyles: Styles = {
   point: { radius: 4, fill: '#1976d2', stroke: '#fff', lineWidth: 1 },
   line: { stroke: '#1976d2', lineWidth: 2 },
   polygon: { fill: 'rgba(25,118,210,0.2)', stroke: '#1976d2', lineWidth: 1 },
 };
 
-export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>(function GeoJSONCanvas(
+export const GeoVisualizerFull = forwardRef<GeoVisualizerHandle, GeoVisualizerFullProps>(function GeoVisualizerFull(
   props,
   ref
 ) {
@@ -88,16 +226,20 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
     geojson,
     padding = 20,
     styles = {},
-    background = null,
+    background = '#ffffff',
+    legend,
     interactive = true,
     onFeatureClick,
     onFeatureHover,
     getFeatureId,
     devicePixelRatio = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1,
     fitBoundsOnLoad = true,
+    showGrid = false,
+    gridConfig = {},
+    minDataPixels = 20,
   } = props;
 
-  const mergedStyles = { ...defaultStyles, ...styles } as Styles;
+  const mergedStyles = useMemo(() => ({ ...defaultStyles, ...styles } as Styles), [styles]);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef({
     viewport: { scale: 1, translateX: 0, translateY: 0 },
@@ -105,9 +247,9 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
     featureBounds: null as any,
     hoverId: null as FeatureId | null,
     dpr: devicePixelRatio,
+    minScale: 0,
   });
 
-  // Build an internal representation of features with projected coordinates in [0..1] space (mercator x,y normalized)
   const buildInternalFeatures = useCallback((gj: any) => {
     const features = extractFeatures(gj).map((f: any, i: number) => ({
       id: (getFeatureId ? getFeatureId(f, i) : i) as FeatureId,
@@ -117,10 +259,8 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
     stateRef.current.featureBounds = getBoundsOfGeojson(gj);
   }, [getFeatureId]);
 
-  // Convert mercator normalized coordinates to canvas pixels (taking viewport into account)
   const mercatorToCanvas = useCallback((xNorm: number, yNorm: number, ctxW: number, ctxH: number) => {
     const vp = stateRef.current.viewport;
-    // world coords normalized 0..1 => pixel coords
     const x = xNorm * ctxW * vp.scale + vp.translateX;
     const y = yNorm * ctxH * vp.scale + vp.translateY;
     return { x, y };
@@ -190,7 +330,6 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
             if (!started) { ctx.moveTo(c.x, c.y); started = true; }
             else ctx.lineTo(c.x, c.y);
           }
-          // close ring
         }
         if (tPoly.fill) { ctx.fillStyle = tPoly.fill; ctx.fill(); }
         if (tPoly.stroke) { ctx.lineWidth = tPoly.lineWidth || 1; ctx.strokeStyle = tPoly.stroke; ctx.stroke(); }
@@ -210,21 +349,23 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
     canvas.height = Math.round(cssH * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    // background
-    if (background) {
+    if (background && background !== 'transparent') {
       ctx.fillStyle = background;
       ctx.fillRect(0, 0, cssW, cssH);
     } else {
       ctx.clearRect(0, 0, cssW, cssH);
     }
 
+    if (showGrid) drawGrid(ctx, cssW, cssH, stateRef.current.viewport, gridConfig);
+
     const features = stateRef.current.features || [];
     for (const f of features) {
       drawFeature(ctx, f, cssW, cssH);
     }
-  }, [background, drawFeature]);
 
-  // Fit bounds: find bounding box and compute scale/translate to fit into canvas
+    if (legend) drawLegend(ctx, legend, cssW, cssH);
+  }, [background, drawFeature, legend, showGrid, gridConfig]);
+
   const fitBounds = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -232,26 +373,33 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
     if (!bounds) return;
     const cssW = canvas.clientWidth;
     const cssH = canvas.clientHeight;
+    if (!cssW || !cssH) return;
     const { minX, minY, maxX, maxY } = bounds;
     const worldW = (maxX - minX) || 1e-6;
     const worldH = (maxY - minY) || 1e-6;
-    const scaleX = (cssW - padding * 2) / worldW;
-    const scaleY = (cssH - padding * 2) / worldH;
+    // mercatorToCanvas: pixel = norm * canvasSize * scale + translate
+    // We want: minNorm * W * scale + tx = leftEdge, maxNorm * W * scale + tx = rightEdge
+    // → worldW * W * scale = W - 2*padding → scale = (W-2p)/(worldW*W)
+    const scaleX = (cssW - padding * 2) / (worldW * cssW);
+    const scaleY = (cssH - padding * 2) / (worldH * cssH);
     const scale = Math.min(scaleX, scaleY);
-    const translateX = -minX * cssW * scale + padding + (cssW - (worldW * cssW * scale) - padding * 2) / 2;
-    const translateY = -minY * cssH * scale + padding + (cssH - (worldH * cssH * scale) - padding * 2) / 2;
+    // minScale: zoom out until the data's largest screen dimension = minDataPixels
+    const largestDim = Math.max(worldW * cssW, worldH * cssH, 1);
+    stateRef.current.minScale = minDataPixels / largestDim;
+    const dataPixW = worldW * cssW * scale;
+    const dataPixH = worldH * cssH * scale;
+    const translateX = -minX * cssW * scale + (cssW - dataPixW) / 2;
+    const translateY = -minY * cssH * scale + (cssH - dataPixH) / 2;
     stateRef.current.viewport = { scale, translateX, translateY };
     render();
-  }, [padding, render]);
+  }, [padding, render, minDataPixels]);
 
   useImperativeHandle(ref, () => ({
     fitBounds: () => fitBounds(),
     toDataURL: (type?: string, quality?: number) => (canvasRef.current ? canvasRef.current.toDataURL(type, quality) : ''),
   }));
 
-  // Interaction helpers: simple point-in-polygon and point-to-line distance
   function pointInPolygon(x: number, y: number, poly: number[][]) {
-    // ray-casting algorithm
     let inside = false;
     for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
       const xi = poly[i][0], yi = poly[i][1];
@@ -268,9 +416,7 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
     if (dx === 0 && dy === 0) return Math.hypot(px - x1, py - y1);
     const t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy);
     const tt = Math.max(0, Math.min(1, t));
-    const cx = x1 + tt * dx;
-    const cy = y1 + tt * dy;
-    return Math.hypot(px - cx, py - cy);
+    return Math.hypot(px - (x1 + tt * dx), py - (y1 + tt * dy));
   }
 
   const hitTest = useCallback((x: number, y: number) => {
@@ -279,7 +425,6 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
     const cssW = canvas.clientWidth;
     const cssH = canvas.clientHeight;
     const features = stateRef.current.features || [];
-    // iterate backwards so top-most features are tested first
     for (let i = features.length - 1; i >= 0; i--) {
       const f = features[i];
       const geom = f.feature.geometry;
@@ -293,7 +438,6 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
       } else if (type === 'Polygon' || type === 'MultiPolygon') {
         const polys = type === 'Polygon' ? [geom.coordinates] : geom.coordinates;
         for (const poly of polys) {
-          // test outer ring only for now
           const ring = poly[0];
           const ringPx: number[][] = ring.map((coord: number[]) => {
             const p = lonLatToMercator(coord[0], coord[1]);
@@ -311,8 +455,7 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
             const b = line[vi + 1];
             const pa = mercatorToCanvas(lonLatToMercator(a[0], a[1]).x, lonLatToMercator(a[0], a[1]).y, cssW, cssH);
             const pb = mercatorToCanvas(lonLatToMercator(b[0], b[1]).x, lonLatToMercator(b[0], b[1]).y, cssW, cssH);
-            const d = distanceToSegment(x, y, pa.x, pa.y, pb.x, pb.y);
-            if (d <= tolerance) return f;
+            if (distanceToSegment(x, y, pa.x, pa.y, pb.x, pb.y) <= tolerance) return f;
           }
         }
       }
@@ -322,9 +465,7 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
 
   useEffect(() => {
     buildInternalFeatures(geojson);
-    // autoscale
     if (fitBoundsOnLoad) {
-      // wait for layout
       requestAnimationFrame(() => { fitBounds(); });
     } else {
       render();
@@ -332,18 +473,46 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geojson, buildInternalFeatures]);
 
-  // mouse interactions
   useEffect(() => {
     if (!interactive) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     let lastHoverId: any = null;
+    let isDragging = false;
+    let hasDragged = false;
+    let dragStart = { x: 0, y: 0 };
+    let vpStart = { scale: 1, translateX: 0, translateY: 0 };
 
-    const onMove = (ev: MouseEvent) => {
+    canvas.style.cursor = 'grab';
+
+    const onMouseDown = (ev: MouseEvent) => {
+      if (ev.button !== 0) return;
+      isDragging = true;
+      hasDragged = false;
+      dragStart = { x: ev.clientX, y: ev.clientY };
+      vpStart = { ...stateRef.current.viewport };
+      canvas.style.cursor = 'grabbing';
+    };
+
+    const onMouseMove = (ev: MouseEvent) => {
+      if (isDragging) {
+        const dx = ev.clientX - dragStart.x;
+        const dy = ev.clientY - dragStart.y;
+        if (Math.abs(dx) > 2 || Math.abs(dy) > 2) hasDragged = true;
+        const cssW = canvas.clientWidth;
+        const cssH = canvas.clientHeight;
+        stateRef.current.viewport = clampViewport(
+          { scale: vpStart.scale, translateX: vpStart.translateX + dx, translateY: vpStart.translateY + dy },
+          cssW, cssH, stateRef.current.featureBounds, padding, stateRef.current.minScale,
+        );
+        render();
+        return;
+      }
       const rect = canvas.getBoundingClientRect();
-      const x = (ev.clientX - rect.left);
-      const y = (ev.clientY - rect.top);
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      if (x < 0 || x > rect.width || y < 0 || y > rect.height) return;
       const hit = hitTest(x, y);
       const hitId = hit ? hit.id : null;
       if (hitId !== lastHoverId) {
@@ -352,90 +521,68 @@ export const GeoCanvasFull = forwardRef<GeoJSONCanvasHandle, GeoJSONCanvasProps>
       }
     };
 
-    const onClick = (ev: MouseEvent) => {
+    const onMouseUp = (ev: MouseEvent) => {
+      if (!isDragging) return;
+      isDragging = false;
+      canvas.style.cursor = 'grab';
+      if (!hasDragged) {
+        const rect = canvas.getBoundingClientRect();
+        const x = ev.clientX - rect.left;
+        const y = ev.clientY - rect.top;
+        const hit = hitTest(x, y);
+        if (hit && onFeatureClick) onFeatureClick(hit.feature, hit.id, ev);
+      }
+    };
+
+    const onWheel = (ev: WheelEvent) => {
+      ev.preventDefault();
       const rect = canvas.getBoundingClientRect();
-      const x = (ev.clientX - rect.left);
-      const y = (ev.clientY - rect.top);
-      const hit = hitTest(x, y);
-      if (hit && onFeatureClick) onFeatureClick(hit.feature, hit.id, ev);
+      const cx = ev.clientX - rect.left;
+      const cy = ev.clientY - rect.top;
+      if (!canvas.clientWidth || !canvas.clientHeight) return;
+      const factor = ev.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const vp = stateRef.current.viewport;
+      const desiredScale = vp.scale * factor;
+      const newScale = stateRef.current.minScale > 0
+        ? Math.max(stateRef.current.minScale, desiredScale)
+        : desiredScale;
+      // actualFactor derived from clamped scale: when scale can't change, translate also won't change.
+      const actualFactor = newScale / vp.scale;
+      const cssW = canvas.clientWidth;
+      const cssH = canvas.clientHeight;
+      stateRef.current.viewport = clampViewport(
+        {
+          scale: newScale,
+          translateX: cx - actualFactor * (cx - vp.translateX),
+          translateY: cy - actualFactor * (cy - vp.translateY),
+        },
+        cssW, cssH, stateRef.current.featureBounds, padding, stateRef.current.minScale,
+      );
+      render();
     };
 
-    canvas.addEventListener('mousemove', onMove);
-    canvas.addEventListener('click', onClick);
+    canvas.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+
     return () => {
-      canvas.removeEventListener('mousemove', onMove);
-      canvas.removeEventListener('click', onClick);
+      canvas.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      canvas.removeEventListener('wheel', onWheel);
+      canvas.style.cursor = '';
     };
-  }, [interactive, hitTest, onFeatureClick, onFeatureHover]);
+  }, [interactive, hitTest, onFeatureClick, onFeatureHover, render, padding]);
 
-  // initial sizing: set canvas CSS size; user can override with width/height props
-  const style: React.CSSProperties = { width: width + 'px', height: height + 'px', display: 'block' };
+  const canvasStyle: React.CSSProperties = { width: width + 'px', height: height + 'px', display: 'block' };
 
   return (
     <canvas
       ref={canvasRef}
-      style={style}
+      style={canvasStyle}
       role="img"
-      aria-label="GeoJSON preview canvas"
+      aria-label="Geographic data canvas"
     />
   );
 });
-
-
-/*
-  README & usage (included in this single-file library preview)
-
-  # geojson-canvas
-
-  A small lightweight React component that renders GeoJSON onto a HTMLCanvasElement for fast previewing of Points, Lines and Polygons.
-
-  ## Features
-  - Fast canvas rendering for large datasets
-  - Basic Mercator projection (suitable for most web maps)
-  - Fit-to-bounds
-  - Interaction: hover and click with geometry hit-testing
-  - Exposes imperative handle for fitBounds and export
-
-  ## Installation
-  Copy `GeoJSONCanvas.tsx` into your project, or publish as an npm/pnpm package. No runtime dependencies.
-
-  ## Example
-
-  ```tsx
-  import React, { useRef } from 'react';
-  import GeoJSONCanvas from './GeoJSONCanvas';
-
-  const example = {
-    type: 'FeatureCollection',
-    features: [
-      { type: 'Feature', properties: { name: 'A' }, geometry: { type: 'Point', coordinates: [100.5, 13.75] } },
-      { type: 'Feature', properties: { name: 'B' }, geometry: { type: 'Polygon', coordinates: [[[100,13],[101,13],[101,14],[100,14],[100,13]]] } }
-    ]
-  };
-
-  export default function App() {
-    const ref = useRef<any>(null);
-    return (
-      <div>
-        <button onClick={() => ref.current?.fitBounds()}>Fit</button>
-        <GeoJSONCanvas
-          ref={ref}
-          geojson={example}
-          width={900}
-          height={600}
-          onFeatureClick={(f)=>console.log('clicked', f)}
-          onFeatureHover={(f)=>console.log('hover', f)}
-        />
-      </div>
-    );
-  }
-  ```
-
-  ## Extending
-  - Replace the simple mercator functions with d3-geo if you need advanced projections.
-  - Add a tiles/background layer for basemaps (draw image tiles behind features).
-  - Add clustering or WEBGL backend for truly massive datasets.
-
-  ## Notes
-  - This code focuses on a good DX for embedding as a component in applications or libs. It is intentionally dependency-free so you can control the bundle size.
-*/
