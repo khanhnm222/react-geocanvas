@@ -3,3 +3,7 @@ export type { GeoVisualizerProps, GeoVisualizerStyle } from './components/GeoVis
 
 export { GeoVisualizerFull } from './components/GeoVisualizerFull';
 export type { GeoVisualizerFullProps } from './components/GeoVisualizerFull';
+
+export { parseKML } from './parsers/kml';
+
+export * from './types';
