@@ -1,35 +1,51 @@
 {
-  "name": "react-geocanvas",
+  "name": "react-geovisualizer",
   "version": "1.0.0",
-  "description": "A lightweight React library for rendering GeoJSON data directly onto HTML5 Canvas. react-geocanvas is designed for fast, map-free visualization of geographic data, supporting multiple GeoJSON geometry types with customizable styles and high performance rendering.",
+  "description": "Lightweight React library for rendering GeoJSON, KML and Shapefile data directly onto HTML5 Canvas — fast, map-free geographic visualization with zero runtime dependencies.",
   "license": "MIT",
-  "author": "Your Name",
+  "author": "Khanh Nguyen",
+  "keywords": [
+    "react",
+    "geojson",
+    "kml",
+    "shapefile",
+    "canvas",
+    "map",
+    "gis",
+    "geographic",
+    "visualization",
+    "geo",
+    "renderer",
+    "mercator"
+  ],
+  "sideEffects": false,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/khanhnm222/react-geocanvas.git"
+    "url": "git+https://github.com/khanhnm222/react-geovisualizer.git"
   },
   "bugs": {
-    "url": "https://github.com/khanhnm222/react-geocanvas/issues"
+    "url": "https://github.com/khanhnm222/react-geovisualizer/issues"
   },
-  "homepage": "https://github.com/khanhnm222/react-geocanvas#readme",
-  "main": "dist/index.cjs",
-  "module": "dist/index.js",
+  "homepage": "https://github.com/khanhnm222/react-geovisualizer#readme",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
   "files": [
     "dist"
   ],
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
     }
   },
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "lint": "eslint src --ext .ts,.tsx",
-    "test": "echo \"No tests yet\" && exit 0"
+    "test": "echo \"No tests yet\" && exit 0",
+    "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
     "react": ">=17",
