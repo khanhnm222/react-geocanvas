@@ -5,5 +5,6 @@ export { GeoVisualizerFull } from './components/GeoVisualizerFull';
 export type { GeoVisualizerFullProps } from './components/GeoVisualizerFull';
 
 export { parseKML } from './parsers/kml';
+export { parseShapefile } from './parsers/shapefile';
 
 export * from './types';
